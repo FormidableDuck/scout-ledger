@@ -148,6 +148,62 @@ def get(url, tries=3, **kw):
 
 # --------------------------------------------------------------------------- understat
 
+US_HEADERS = {"X-Requested-With": "XMLHttpRequest", "Accept": "application/json, text/javascript, */*; q=0.01"}
+
+
+def describe_page(content):
+    """Short description of a non-JSON reply, so the app can show what Understat actually sent."""
+    text = content[:4000].decode("utf-8", "replace")
+    t = re.search(r"<title[^>]*>(.*?)</title>", text, re.S | re.I)
+    title = re.sub(r"\s+", " ", t.group(1)).strip()[:60] if t else ""
+    if re.search(r"cf-chl|challenge-platform|Just a moment|Attention Required", text, re.I):
+        kind = "Cloudflare bot check"
+    elif "captcha" in text.lower():
+        kind = "captcha page"
+    else:
+        kind = "web page"
+    return f"{kind}{' “' + title + '”' if title else ''}, {len(content):,} bytes"
+
+
+def parse_json(content):
+    try:
+        return json.loads(content.decode("utf-8-sig"))  # tolerates a byte-order mark
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def understat_json(path, referer):
+    """GET an Understat AJAX endpoint. Falls back to a browser-like client if the plain one is refused."""
+    url = f"https://understat.com/{path}"
+    r = get(url, headers={**US_HEADERS, "Referer": referer})
+    if r is not None:
+        data = parse_json(r.content)
+        if data is not None:
+            return data
+        LAST_ERR[0] = describe_page(r.content)
+    if impersonated is None:
+        return None
+    try:
+        r2 = impersonated.get(url, headers={**US_HEADERS, "Referer": referer}, impersonate="chrome", timeout=45)
+        if r2.status_code == 200:
+            data = parse_json(r2.content)
+            if data is not None:
+                US_VIA[0] = "browser-like client"
+                return data
+            LAST_ERR[0] += f"; browser client also got {describe_page(r2.content)}"
+        else:
+            LAST_ERR[0] += f"; browser client got HTTP {r2.status_code}"
+    except Exception as e:
+        LAST_ERR[0] += f"; browser client error {type(e).__name__}"
+    return None
+
+
+try:
+    from curl_cffi import requests as impersonated  # mimics Chrome's network fingerprint
+except ImportError:
+    impersonated = None
+US_VIA = [""]
+
 def fetch_understat(season):
     """Returns {league: [player dicts]} with season totals."""
     out = {}
@@ -155,15 +211,9 @@ def fetch_understat(season):
     for league, (slug, _) in LEAGUES.items():
         players = None
         for sl in dict.fromkeys([slug, slug.replace("_liga", "_Liga"), slug.replace("_Liga", "_liga")]):
-            r = get(f"https://understat.com/getLeagueData/{sl}/{season}",
-                    headers={"X-Requested-With": "XMLHttpRequest", "Accept": "application/json, text/javascript, */*",
-                             "Referer": f"https://understat.com/league/{sl}/{season}"})
-            if not r:
-                continue
-            try:
-                data = r.json()
-            except ValueError:
-                LAST_ERR[0] = f"{league}: page instead of data (site layout changed?)"
+            LAST_ERR[0] = ""
+            data = understat_json(f"getLeagueData/{sl}/{season}", f"https://understat.com/league/{sl}/{season}")
+            if not isinstance(data, dict):
                 continue
             players = data.get("players", [])
             if isinstance(players, dict):
@@ -210,7 +260,7 @@ def summarise_shots(shots, season):
 
 def fetch_understat_shots(players_by_league, season, cache):
     """Per-player shot logs. Cached by shot count so each daily run only refetches movers."""
-    done = 0
+    done = failed = 0
     for league, players in players_by_league.items():
         for p in players:
             pid, nshots = str(p["id"]), int(p.get("shots", 0))
@@ -219,16 +269,15 @@ def fetch_understat_shots(players_by_league, season, cache):
             c = cache.get(pid)
             if c and c.get("n") == nshots and c.get("season") == season:
                 continue
-            r = get(f"https://understat.com/getPlayerData/{pid}",
-                    headers={"X-Requested-With": "XMLHttpRequest",
-                             "Referer": f"https://understat.com/player/{pid}"})
+            data = understat_json(f"getPlayerData/{pid}", f"https://understat.com/player/{pid}")
             time.sleep(REQUEST_PAUSE)
-            if not r:
+            if not isinstance(data, dict):
+                failed += 1
+                if failed >= 25 and done == 0:
+                    note("understat", f"shot logs: {LAST_ERR[0]}")
+                    return cache  # site is refusing us; don't hammer it
                 continue
-            try:
-                shots = r.json().get("shots", [])
-            except ValueError:
-                continue
+            shots = data.get("shots", [])
             cache[pid] = {"n": nshots, "season": season, **summarise_shots(shots, season)}
             done += 1
     log(f"understat shots: refreshed {done} players")
@@ -594,7 +643,7 @@ def main():
             except Exception as e:  # a broken source must never stop the others
                 note(name, f"{type(e).__name__}: {e}"[:200])
                 data = None
-            via = {"fpl": FPL_VIA[0], "transfermarkt": TM_VIA[0]}.get(name)
+            via = {"fpl": FPL_VIA[0], "transfermarkt": TM_VIA[0], "understat": US_VIA[0]}.get(name)
             if ok(data):
                 store(name, data)
                 sources[name] = {"status": "partial" if ERRORS.get(name) else "ok", "updated": asof or now}
